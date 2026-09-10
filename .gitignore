@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# VS Code local settings
+.vscode/
+
+# Transcription outputs
+*.txt
+*.json
+*.srt
+*.vtt
+
+# Audio/video input
+*.m4a
+*.mp3
+*.wav
+*.mp4
+*.mov
+
+# Temporary files
+*.tmp
