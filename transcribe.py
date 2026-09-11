@@ -18,7 +18,8 @@ Install
     pip install faster-whisper tqdm          # recommended, CPU-friendly
     pip install transformers torch torchaudio tqdm
     pip install silero-vad                   # only for --vad on with --backend transformers
-    ffmpeg is used for decoding when present, torchaudio otherwise.
+    Decoding needs no external ffmpeg: PyAV comes with faster-whisper and
+    bundles the ffmpeg libraries. An ffmpeg on PATH is used as a fallback.
 
 Examples
     python transcribe.py meeting.m4a
@@ -147,39 +148,65 @@ def prompt_for_vad(default: str = DEFAULT_VAD) -> str:
 # audio
 # --------------------------------------------------------------------------- #
 
+def _decode_av(path: str, sr: int) -> np.ndarray:
+    """Decode in-process with PyAV, which bundles ffmpeg's libraries."""
+    import av  # noqa: PLC0415
+
+    with av.open(path) as container:
+        if not container.streams.audio:
+            raise RuntimeError(f"no audio stream in {path}")
+        stream = container.streams.audio[0]
+        stream.thread_type = "AUTO"
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=sr)
+
+        blocks: List[np.ndarray] = []
+        for frame in container.decode(stream):
+            for out in resampler.resample(frame):
+                blocks.append(out.to_ndarray().reshape(-1))
+        for out in resampler.resample(None):  # flush the resampler's tail
+            blocks.append(out.to_ndarray().reshape(-1))
+
+    if not blocks:
+        return np.zeros(0, np.float32)
+    return np.concatenate(blocks).astype(np.float32) / 32768.0
+
+
+def _decode_ffmpeg_cli(path: str, sr: int) -> np.ndarray:
+    """Decode by piping s16le out of the ffmpeg binary on PATH."""
+    cmd = [
+        "ffmpeg", "-nostdin", "-threads", "0",
+        "-i", path,
+        "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr),
+        "-",
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-6:]
+        raise RuntimeError(
+            f"ffmpeg could not decode {path}:\n  " + "\n  ".join(tail)
+        )
+    return np.frombuffer(proc.stdout, np.int16).astype(np.float32) / 32768.0
+
+
 def load_audio(path: str, sr: int = SR) -> np.ndarray:
     """Decode any container to mono float32 at `sr`.
 
-    Uses ffmpeg when available so that stereo WAVs, odd sample rates and
-    compressed formats are all handled the same way. Falls back to torchaudio,
-    which needs an explicit channel downmix.
+    PyAV does the work: it ships ffmpeg's libraries inside the wheel, so a
+    plain `pip install -r requirements.txt` is enough and the decode behaves
+    the same on every machine. The ffmpeg CLI stays as a fallback for the
+    rare container PyAV's build cannot open; the two agree sample for sample.
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
 
-    if shutil.which("ffmpeg"):
-        cmd = [
-            "ffmpeg", "-nostdin", "-threads", "0",
-            "-i", path,
-            "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr),
-            "-",
-        ]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if proc.returncode != 0:
-            tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()[-6:]
-            raise RuntimeError(
-                f"ffmpeg could not decode {path}:\n  " + "\n  ".join(tail)
-            )
-        return np.frombuffer(proc.stdout, np.int16).astype(np.float32) / 32768.0
-
-    import torchaudio  # noqa: PLC0415
-
-    wav, in_sr = torchaudio.load(path)
-    if wav.ndim == 2 and wav.shape[0] > 1:
-        wav = wav.mean(dim=0, keepdim=True)  # downmix; squeeze() alone is a bug
-    if in_sr != sr:
-        wav = torchaudio.functional.resample(wav, in_sr, sr)
-    return wav.reshape(-1).numpy().astype(np.float32)
+    try:
+        return _decode_av(path, sr)
+    except Exception as exc:  # noqa: BLE001 - any decode failure is worth retrying
+        if not shutil.which("ffmpeg"):
+            raise
+        print(f"  note: PyAV could not decode ({exc}); using the ffmpeg CLI",
+              file=sys.stderr)
+        return _decode_ffmpeg_cli(path, sr)
 
 
 # --------------------------------------------------------------------------- #
