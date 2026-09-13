@@ -16,6 +16,9 @@ venv/
 *.srt
 *.vtt
 
+# ...but this one is a project file, not output
+!requirements.txt
+
 # Audio/video input
 *.m4a
 *.mp3

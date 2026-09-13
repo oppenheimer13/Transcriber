@@ -1,0 +1,18 @@
+# Core dependencies - the default faster-whisper backend.
+#   py -m pip install -r requirements.txt
+numpy>=1.21
+faster-whisper>=1.0.2   # 1.0.2 added `hotwords`, which --vocab relies on
+av>=10                  # in-process decoding; bundles ffmpeg's own libraries
+tqdm>=4.62              # progress bar with a realtime-factor ETA
+
+# Optional - only for `--backend transformers`. Large download; the
+# faster-whisper backend above is several times faster on CPU.
+#   py -m pip install transformers torch torchaudio
+# transformers>=4.40
+# torch
+# torchaudio
+
+# Optional - only for `--backend transformers --mode chunked --vad on`.
+# The faster-whisper backend has VAD built in and needs nothing extra.
+#   py -m pip install silero-vad
+# silero-vad
