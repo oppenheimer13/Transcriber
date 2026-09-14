@@ -49,8 +49,9 @@ py transcribe.py -m large-v3-turbo --vad off meeting.m4a
 # Swedish interview, subtitles as well
 py transcribe.py -m kb-medium -l sv --formats txt,srt intervju.mp3
 
-# several files in one load of the model
-py transcribe.py -m kb-large -l sv *.m4a
+# several files in one load of the model. PowerShell does not expand globs
+# for native commands, so let Get-ChildItem do it:
+py transcribe.py -m kb-large -l sv (gci *.m4a)
 ```
 
 Progress, timings and warnings go to stderr; only the output files are written
@@ -118,7 +119,7 @@ backend and is ignored elsewhere.
 | `--task` | `transcribe` | or `translate`, to English |
 | `--backend` | `auto` | `faster-whisper` or `transformers` |
 | `--device` | `auto` | `cpu` or `cuda` |
-| `--compute-type` | `auto` | faster-whisper precision: `int8` on CPU, `float16` on GPU |
+| `--compute-type` | `auto` | faster-whisper precision: `int8`, `float16`, `float32`, ... |
 | `--beams` | `5` | `1` is fastest, `5` more accurate |
 | `--vad` | ask, else `off` | drop non-speech before decoding |
 | `--vad-min-silence` | `400` | ms of silence that splits speech |

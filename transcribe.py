@@ -15,11 +15,11 @@ Backends
                                            silence with Silero VAD
 
 Install
-    pip install faster-whisper tqdm          # recommended, CPU-friendly
-    pip install transformers torch torchaudio tqdm
+    pip install -r requirements.txt          # recommended, CPU-friendly
+    pip install transformers torch torchaudio    # only for --backend transformers
     pip install silero-vad                   # only for --vad on with --backend transformers
-    Decoding needs no external ffmpeg: PyAV comes with faster-whisper and
-    bundles the ffmpeg libraries. An ffmpeg on PATH is used as a fallback.
+    Decoding needs no external ffmpeg: PyAV bundles the ffmpeg libraries.
+    An ffmpeg on PATH is used as a fallback. See README.md for the full guide.
 
 Examples
     python transcribe.py meeting.m4a
@@ -251,12 +251,17 @@ def load_audio(path: str, sr: int = SR) -> np.ndarray:
 
 def format_timestamp(seconds: float, decimal: str = ".", ms: bool = False) -> str:
     seconds = max(0.0, float(seconds))
-    whole = int(seconds)
-    h, rem = divmod(whole, 3600)
-    m, s = divmod(rem, 60)
     if not ms:
+        h, rem = divmod(int(seconds), 3600)
+        m, s = divmod(rem, 60)
         return f"{h:02d}:{m:02d}:{s:02d}"
-    thousandths = int(round((seconds - whole) * 1000))
+    # Round to whole milliseconds *before* splitting. Splitting first and then
+    # rounding the fraction lets it carry to 1000 and emit a 4-digit field:
+    # 1.9996 -> "00:00:01,1000", which is not valid SRT or WebVTT.
+    total_ms = int(round(seconds * 1000))
+    h, rem = divmod(total_ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, thousandths = divmod(rem, 1000)
     return f"{h:02d}:{m:02d}:{s:02d}{decimal}{thousandths:03d}"
 
 
@@ -511,7 +516,7 @@ class FasterWhisperBackend:
     def __init__(self, model_id: str, device: str, compute_type: str,
                  language: Optional[str], task: str, beams: int, vad: bool,
                  vad_min_silence: int = 400, condition_on_previous: bool = True,
-                 vocab: str = ""):
+                 vocab: Sequence[str] = ()):
         from faster_whisper import WhisperModel  # noqa: PLC0415
 
         self.language = language
@@ -520,11 +525,12 @@ class FasterWhisperBackend:
         self.vad = vad
         self.vad_min_silence = vad_min_silence
         self.condition_on_previous = condition_on_previous
-        self.vocab = vocab.strip()
+        self.vocab = list(vocab)
         self.model = WhisperModel(model_id, device=device, compute_type=compute_type)
 
-    def transcribe(self, audio: np.ndarray, vocab: str = "") -> List[Segment]:
-        vocab = (vocab or self.vocab).strip()
+    def transcribe(self, audio: np.ndarray,
+                   vocab: Sequence[str] = ()) -> List[Segment]:
+        terms = list(vocab) or self.vocab
         kwargs = dict(
             language=self.language,
             task=self.task,
@@ -537,10 +543,10 @@ class FasterWhisperBackend:
             vad_filter=self.vad,
             vad_parameters={"min_silence_duration_ms": self.vad_min_silence},
         )
-        if vocab:
+        if terms:
             # hotwords bias every window, unlike initial_prompt which only
             # reaches the first one when conditioning is off
-            kwargs["hotwords"] = vocab
+            kwargs["hotwords"] = ", ".join(terms)
 
         try:
             segments, info = self.model.transcribe(audio, **kwargs)
@@ -850,22 +856,28 @@ def pick_backend(requested: str, model: str) -> str:
     return "transformers"
 
 
-def load_vocab(spec: str) -> str:
-    """Vocabulary terms, given inline or as @path to a text file."""
+def load_vocab(spec: str) -> List[str]:
+    """Vocabulary terms, given inline or as @path to a text file.
+
+    Returns a list rather than a joined string so that a term containing a
+    comma ("Smith, John") stays one term - joining first and splitting later
+    counted it as two.
+    """
     if not spec:
-        return ""
+        return []
     if spec.startswith("@"):
         path = spec[1:]
         try:
             # utf-8-sig: Notepad and PowerShell often write a BOM, which would
             # otherwise end up glued to the first term
             with open(path, encoding="utf-8-sig") as fh:
-                terms = [line.strip() for line in fh if line.strip()
-                         and not line.startswith("#")]
+                # strip before testing for '#': an indented comment is still a
+                # comment, and was otherwise imported as a vocabulary term
+                lines = (line.strip() for line in fh)
+                return [ln for ln in lines if ln and not ln.startswith("#")]
         except OSError as exc:
             raise SystemExit(f"could not read vocabulary file: {exc}") from exc
-        return ", ".join(terms)
-    return spec.strip()
+    return [t.strip() for t in spec.split(",") if t.strip()]
 
 
 def find_vocab(audio_path: str) -> Optional[str]:
@@ -921,7 +933,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="transformers only (default: longform)")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--compute-type", default="auto",
-                   help="faster-whisper precision, e.g. int8, int8_float16, float16")
+                   choices=["auto", "int8", "int8_float16", "int8_bfloat16",
+                            "float16", "bfloat16", "float32"],
+                   help="faster-whisper precision (default: int8 on CPU, "
+                        "float16 on GPU)")
     p.add_argument("--beams", type=int, default=5,
                    help="1 is fastest; 5 is more accurate (default: 5)")
     p.add_argument("--batch-size", type=int, default=0,
@@ -1040,15 +1055,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             warned_speed = True
 
         if args.vocab:
-            vocab, vocab_source = load_vocab(args.vocab), args.vocab.lstrip("@")
+            vocab = load_vocab(args.vocab)
+            # only a file has a name worth printing; inline terms are the text
+            vocab_source = args.vocab[1:] if args.vocab.startswith("@") else None
         else:
             found = find_vocab(path)
-            vocab = load_vocab("@" + found) if found else ""
+            vocab = load_vocab("@" + found) if found else []
             vocab_source = found
         if vocab:
-            count = len([t for t in vocab.split(",") if t.strip()])
-            print(f"  vocab: {count} terms from "
-                  f"{os.path.basename(vocab_source)}", file=sys.stderr)
+            origin = (f" from {os.path.basename(vocab_source)}"
+                      if vocab_source else "")
+            print(f"  vocab: {len(vocab)} terms{origin}", file=sys.stderr)
             if backend_name != "faster-whisper":
                 print("  note: vocabulary biasing needs the faster-whisper "
                       "backend; ignored here", file=sys.stderr)
@@ -1112,7 +1129,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "device": device,
                 "compute_type": compute_type,
                 "mode": args.mode if backend_name == "transformers" else None,
-                "vocab_terms": [t.strip() for t in vocab.split(",") if t.strip()],
+                "vocab_terms": list(vocab),
                 "vocab_source": (os.path.basename(vocab_source)
                                  if vocab and vocab_source else None),
             },
