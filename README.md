@@ -198,3 +198,7 @@ a bar. The default faster-whisper backend shows a real progress bar.
 **`transcribe` is not recognised.** The `pipx` install puts it on your PATH, but
 an open terminal will not pick that up until you restart it. `pipx ensurepath`
 fixes a PATH that never got set up.
+
+## License
+
+MIT - see [LICENSE](LICENSE).
