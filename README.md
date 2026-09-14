@@ -126,7 +126,9 @@ backend and is ignored elsewhere.
 | `--no-minute-markers` | off | omit `[hh:mm:ss]` markers from the `.txt` |
 
 `--mode`, `--batch-size`, `--chunk-s` and `--overlap-s` apply to the
-transformers backend only; `py transcribe.py -h` covers them.
+transformers backend only; `py transcribe.py -h` covers them. `--chunk-s`
+cannot exceed 30 - Whisper's receptive field is fixed at that length, and a
+longer window would be truncated with the remainder silently discarded.
 
 ### Silence filtering
 

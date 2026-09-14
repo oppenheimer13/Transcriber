@@ -272,7 +272,6 @@ def plan_fixed_chunks(
     sr: int,
     chunk_s: float,
     overlap_s: float,
-    min_new_s: float = 2.0,
     min_tail_s: float = 0.25,
 ) -> List[Tuple[int, int]]:
     """Overlapping windows that never end on a silence-padded sliver.
@@ -281,9 +280,9 @@ def plan_fixed_chunks(
     hold a fraction of a second of new speech padded out to 30s with silence -
     reliably hallucinated into "Thank you." / "Subtitles by ...".
 
-    Here, if the final window would carry less than `min_new_s` of unseen audio
-    it is slid backwards to end at EOF at full length instead. The extra overlap
-    costs one window of compute and is removed again by `dedup_overlap_words`.
+    Here the final window is always slid backwards to end at EOF at full length,
+    whenever the recording is long enough to hold one. The extra overlap costs
+    one window of compute and is removed again by `dedup_overlap_words`.
     """
     if n_samples <= 0:
         return []
@@ -295,7 +294,6 @@ def plan_fixed_chunks(
     if overlap >= step:
         raise ValueError("overlap_s must be smaller than chunk_s")
     hop = step - overlap
-    min_new = int(round(min_new_s * sr))
     min_tail = int(round(min_tail_s * sr))
 
     windows: List[Tuple[int, int]] = []
@@ -311,8 +309,15 @@ def plan_fixed_chunks(
             new_audio = n_samples - end
             if new_audio < min_tail:
                 break  # trailing sliver, almost certainly silence
-            if new_audio < min_new:
-                nxt = max(0, n_samples - step)
+            # Whisper pads anything shorter than its 30s field with silence,
+            # and that padding is what provokes "Thank you." / "Subtitles by
+            # ..." hallucinations. A `new_audio < min_new` test only caught the
+            # very smallest tails: 2.5s of new audio still produced a 7.5s
+            # window padded with 22.5s of silence. Whenever a full-length
+            # window fits at all, slide back to one. The extra overlap costs a
+            # single window of compute and is removed by dedup_overlap_words.
+            if n_samples >= step:
+                nxt = n_samples - step
         if nxt <= start:
             break
         start = nxt
@@ -326,7 +331,15 @@ def plan_vad_chunks(
     pad_s: float = 0.2,
     min_silence_ms: int = 400,
 ) -> List[Tuple[int, int]]:
-    """Cut on silence instead of on the clock, so no word straddles a boundary."""
+    """Cut on silence instead of on the clock, so no word straddles a boundary.
+
+    Silence is only a *preferred* boundary, never a guaranteed one: a speaker
+    who runs on for minutes without a `min_silence_ms` pause yields a single
+    speech region far longer than `max_chunk_s`. Whisper's field is fixed at 30s
+    and the feature extractor truncates anything longer without a word, so such
+    a region is hard-split rather than allowed through - a cut mid-word costs a
+    garbled word, letting it through costs everything past the 30s mark.
+    """
     try:
         from silero_vad import get_speech_timestamps, load_silero_vad  # noqa: PLC0415
     except ImportError as exc:  # pragma: no cover
@@ -349,20 +362,32 @@ def plan_vad_chunks(
     limit = int(max_chunk_s * sr)
     pad = int(pad_s * sr)
     windows: List[Tuple[int, int]] = []
+
+    def emit(start: int, end: int) -> None:
+        """Append, hard-splitting anything the 30s field cannot hold."""
+        while end - start > limit:
+            windows.append((start, start + limit))
+            start += limit
+        windows.append((start, end))
+
     cur_start = speech[0]["start"]
     cur_end = speech[0]["end"]
 
     for region in speech[1:]:
         if region["end"] - cur_start > limit:
-            windows.append((cur_start, cur_end))
+            emit(cur_start, cur_end)
             cur_start, cur_end = region["start"], region["end"]
         else:
             cur_end = region["end"]
-    windows.append((cur_start, cur_end))
+    emit(cur_start, cur_end)
 
-    return [
-        (max(0, s - pad), min(len(audio), e + pad)) for s, e in windows
-    ]
+    padded: List[Tuple[int, int]] = []
+    for s, e in windows:
+        s = max(0, s - pad)
+        e = min(len(audio), e + pad)
+        # the padding itself must not push a window back over the limit
+        padded.append((s, min(e, s + limit)))
+    return padded
 
 
 # --------------------------------------------------------------------------- #
@@ -644,6 +669,7 @@ class TransformersBackend:
             windows[i:i + self.batch_size]
             for i in range(0, len(windows), self.batch_size)
         ]
+        prev_window_end = 0  # samples; used to size the de-duplication window
         for batch in _progress(batches, total=len(batches), desc="Transcribing"):
             clips = [audio[s:e] for s, e in batch]
             texts = self._decode(clips, 0.0)
@@ -664,12 +690,35 @@ class TransformersBackend:
                 if not text:
                     continue
                 if dedup:
-                    text = dedup_overlap_words(context, text)
+                    # Size the comparison to the overlap actually present. The
+                    # final window is slid back to full length, which can leave
+                    # a ~29s overlap - far more than a fixed 60-word tail can
+                    # see, so the duplicate survived into the transcript.
+                    # ~3 words/s of speech, doubled for headroom.
+                    overlap_s = max(0.0, (prev_window_end - start) / SR)
+                    tail_words = max(60, int(overlap_s * 6))
+                    text = dedup_overlap_words(context, text,
+                                               max_tail_words=tail_words)
+                else:
+                    tail_words = 60
                 if not text:
                     continue
 
-                segments.append(Segment(start / SR, end / SR, text))
-                context = " ".join((context + " " + text).split()[-80:])
+                # Window bounds, not where the text sits: with overlap every cue
+                # would otherwise start before the previous one ended, which is
+                # invalid in SRT and WebVTT. Without word timestamps the honest
+                # approximation is to butt each cue against its predecessor.
+                start_s, end_s = start / SR, end / SR
+                if segments and start_s < segments[-1].end:
+                    start_s = segments[-1].end
+                if end_s <= start_s:
+                    end_s = start_s + 0.001  # keep cues strictly increasing
+                segments.append(Segment(start_s, end_s, text))
+
+                prev_window_end = max(prev_window_end, end)
+                # the context must be able to hold everything dedup will scan
+                keep = max(80, tail_words + 40)
+                context = " ".join((context + " " + text).split()[-keep:])
         return segments
 
 
@@ -840,7 +889,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="1 is fastest; 5 is more accurate (default: 5)")
     p.add_argument("--batch-size", type=int, default=0,
                    help="chunked mode; 0 = auto (1 on CPU, 8 on GPU)")
-    p.add_argument("--chunk-s", type=float, default=30.0)
+    p.add_argument("--chunk-s", type=float, default=30.0,
+                   help=f"chunked mode window, max {WHISPER_WINDOW_S:.0f} "
+                        "(default: 30)")
     p.add_argument("--overlap-s", type=float, default=5.0)
     p.add_argument("--vad", default=None, choices=["auto", "on", "off"],
                    help="drop non-speech before decoding. Omit to be asked "
@@ -873,6 +924,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     unknown = [f for f in formats if f not in WRITERS]
     if unknown:
         raise SystemExit(f"Unknown output format(s): {', '.join(unknown)}")
+
+    if args.chunk_s > WHISPER_WINDOW_S:
+        raise SystemExit(
+            f"--chunk-s cannot exceed {WHISPER_WINDOW_S:.0f}: Whisper's "
+            "receptive field is fixed at that length and anything longer is "
+            "silently truncated, losing the remainder of the window."
+        )
 
     model_name = args.model or prompt_for_model()
     backend_name = pick_backend(args.backend, model_name)
