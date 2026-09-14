@@ -27,6 +27,9 @@ Examples
     python transcribe.py -m kb-medium -l sv intervju.mp3
     python transcribe.py --vad off meeting.m4a          # keep every quiet passage
     python transcribe.py --backend transformers --mode chunked --vad on x.mp3
+
+Model, language and silence filtering are asked for interactively when -m, -l
+or --vad is omitted, so a bare `python transcribe.py file.m4a` is enough.
 """
 
 from __future__ import annotations
@@ -93,6 +96,13 @@ VAD_MENU = [
 ]
 DEFAULT_VAD = "off"
 
+# shown by the interactive picker; any other ISO code can still be typed
+LANGUAGE_MENU = [
+    ("en", "English"),
+    ("sv", "Swedish"),
+    ("auto", "detect from the audio"),
+]
+
 
 @dataclass
 class Segment:
@@ -103,7 +113,7 @@ class Segment:
 
 def _prompt_menu(title: str, label: str, entries: Sequence[Tuple[str, str]],
                  default: str, also_accept: Sequence[str] = (),
-                 allow_hub_id: bool = False) -> str:
+                 allow_hub_id: bool = False, allow_lang_code: bool = False) -> str:
     """Numbered picker on stderr. Falls through to `default` when not a TTY."""
     if not sys.stdin.isatty():
         return default
@@ -117,7 +127,14 @@ def _prompt_menu(title: str, label: str, entries: Sequence[Tuple[str, str]],
     while True:
         try:
             choice = input(f"{label} [{default}], or q to quit: ").strip()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
+            # stdin is closed or exhausted - a scheduled task, a pipeline, a
+            # terminal that reports isatty() but has nothing to read. Falling
+            # back to the default keeps unattended runs working; aborting the
+            # batch here would be a worse answer than the documented default.
+            print(f"\n  no input available - using '{default}'", file=sys.stderr)
+            return default
+        except KeyboardInterrupt:
             print("\nCancelled.", file=sys.stderr)
             raise SystemExit(130)
         if not choice:
@@ -129,6 +146,8 @@ def _prompt_menu(title: str, label: str, entries: Sequence[Tuple[str, str]],
             return entries[int(choice) - 1][0]
         if allow_hub_id and "/" in choice:
             return choice  # raw hub id - case matters
+        if allow_lang_code and choice.isalpha() and 2 <= len(choice) <= 3:
+            return choice.lower()  # any ISO code, not just the menu entries
         if choice.lower() in valid:
             return choice.lower()
         print(f"  '{choice}' is not on the list - pick a number or a name.",
@@ -142,6 +161,20 @@ def prompt_for_model(default: str = DEFAULT_MODEL) -> str:
 
 def prompt_for_vad(default: str = DEFAULT_VAD) -> str:
     return _prompt_menu("Silence filtering:", "Select", VAD_MENU, default)
+
+
+def default_language(model_name: str) -> str:
+    """KBLab's models are Swedish-tuned; anything else defaults to English.
+
+    Getting this wrong is silent and total: with -l en a Swedish recording is
+    translated rather than transcribed, and the output looks plausible.
+    """
+    return "sv" if model_name.lower().startswith(("kb-", "kblab/")) else "en"
+
+
+def prompt_for_language(default: str = "en") -> str:
+    return _prompt_menu("Language:", "Select language", LANGUAGE_MENU,
+                        default, allow_lang_code=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -878,8 +911,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("-m", "--model", default=None,
                    help=f"{', '.join(MODELS)}, or a Hugging Face id. "
                         f"Omit to be asked interactively (default: {DEFAULT_MODEL})")
-    p.add_argument("-l", "--language", default="en",
-                   help="ISO code, or 'auto' to detect (default: en)")
+    p.add_argument("-l", "--language", default=None,
+                   help="ISO code, or 'auto' to detect. Omit to be asked "
+                        "interactively (default: sv for kb-* models, else en)")
     p.add_argument("--task", default="transcribe", choices=["transcribe", "translate"])
     p.add_argument("--backend", default="auto",
                    choices=["auto", "faster-whisper", "transformers"])
@@ -939,7 +973,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     backend_name = pick_backend(args.backend, model_name)
     model_id = resolve_model(model_name, backend_name)
     device = pick_device(args.device, backend_name)
-    language = None if args.language.lower() in ("auto", "none", "") else args.language
+
+    # Ask rather than silently assuming English: picking kb-large from the menu
+    # and getting a translation back is a trap nobody walks into on purpose.
+    lang_choice = args.language
+    if lang_choice is None:
+        lang_choice = prompt_for_language(default_language(model_name))
+    language = None if lang_choice.lower() in ("auto", "none", "") else lang_choice
 
     if backend_name == "transformers" and args.mode == "chunked":
         batch_size = args.batch_size or (8 if device == "cuda" else 1)

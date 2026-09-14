@@ -37,8 +37,10 @@ of [requirements.txt](requirements.txt) are only for `--backend transformers`.
 py transcribe.py meeting.m4a
 ```
 
-Run with no `-m` or `--vad` and it asks which model and whether to skip silence,
-then writes `meeting.txt` and `meeting.json` next to the recording.
+Run with no `-m`, `-l` or `--vad` and it asks which model, which language and
+whether to skip silence, then writes `meeting.txt` and `meeting.json` next to
+the recording. With stdin closed (a scheduled task) each question takes its
+default instead of stopping.
 
 ```powershell
 # pick everything up front, no prompts
@@ -72,9 +74,10 @@ Weights download on first use and are cached by `huggingface_hub`.
 The `kb-*` repos carry CTranslate2 weights, so faster-whisper loads them
 directly - no conversion step.
 
-> `-l` defaults to **`en`**. Pass `-l sv` for Swedish, or `-l auto` to detect.
-> A Swedish recording run at the default language will be translated, not
-> transcribed.
+> Omit `-l` and you are asked. The offered default follows the model - `sv` for
+> the `kb-*` models, `en` otherwise - so picking `kb-large` from the menu no
+> longer quietly translates your Swedish into English. Pass `-l sv`, `-l auto`,
+> or any other ISO code to skip the question.
 
 ## Output
 
@@ -111,7 +114,7 @@ backend and is ignored elsewhere.
 | Flag | Default | What it does |
 | --- | --- | --- |
 | `-m`, `--model` | ask, else `large-v3-turbo` | model name or Hugging Face id |
-| `-l`, `--language` | `en` | ISO code, or `auto` to detect |
+| `-l`, `--language` | ask, else `sv` for `kb-*` / `en` | ISO code, or `auto` to detect |
 | `--task` | `transcribe` | or `translate`, to English |
 | `--backend` | `auto` | `faster-whisper` or `transformers` |
 | `--device` | `auto` | `cpu` or `cuda` |
