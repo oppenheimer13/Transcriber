@@ -2,10 +2,10 @@
 
 Long-form speech transcription with Whisper, from the command line.
 
-A single script, [transcribe.py](transcribe.py), that turns an audio or video
-recording into text. It is built for hour-long material - meetings, interviews,
-talks - where the usual "chop into 30-second windows" approach drifts, repeats
-itself, and hallucinates `Thank you.` into every silent passage.
+A command-line tool that turns an audio or video recording into text. It is
+built for hour-long material - meetings, interviews, talks - where the usual
+"chop into 30-second windows" approach drifts, repeats itself, and hallucinates
+`Thank you.` into every silent passage.
 
 - **No ffmpeg install.** Audio is decoded in-process by PyAV, which ships
   ffmpeg's libraries inside the wheel. An `ffmpeg` on `PATH` is used only as a
@@ -20,22 +20,43 @@ itself, and hallucinates `Thank you.` into every silent passage.
 
 ## Install
 
-Python 3.9 or newer.
+Python 3.9 or newer. No ffmpeg, and no model downloads at install time.
+
+**To use it** - `pipx` gives the tool its own isolated environment and puts a
+`transcribe` command on your PATH, usable from any folder:
+
+```powershell
+py -m pip install --user pipx
+pipx install git+https://github.com/oppenheimer13/Transcriber
+```
+
+**To work on it** - an editable install, so your edits take effect immediately:
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-py -m pip install -r requirements.txt
+py -m pip install -e .
 ```
 
-That is everything the default backend needs. The optional extras at the bottom
-of [requirements.txt](requirements.txt) are only for `--backend transformers`.
+Either way the dependencies come down automatically. `pip install -r
+requirements.txt` still works and does the same as the editable install.
+
+The optional backend is a separate, much larger install:
+`pip install -e .[transformers]`, plus `.[vad]` for Silero VAD.
+
+> Model weights are **not** installed. The one you pick is downloaded on first
+> use and cached in `~/.cache/huggingface`, shared by every environment on the
+> machine - so the first run of a given model is slow and the rest are instant.
+> The default `large-v3-turbo` is 1.6 GB; `-m tiny` (75 MB) is a quick way to
+> check an install works.
 
 ## Quick start
 
 ```powershell
-py transcribe.py meeting.m4a
+transcribe meeting.m4a
 ```
+
+Without installing, from a clone: `python -m transcriber meeting.m4a`.
 
 Run with no `-m`, `-l` or `--vad` and it asks which model, which language and
 whether to skip silence, then writes `meeting.txt` and `meeting.json` next to
@@ -44,14 +65,14 @@ default instead of stopping.
 
 ```powershell
 # pick everything up front, no prompts
-py transcribe.py -m large-v3-turbo --vad off meeting.m4a
+transcribe -m large-v3-turbo --vad off meeting.m4a
 
 # Swedish interview, subtitles as well
-py transcribe.py -m kb-medium -l sv --formats txt,srt intervju.mp3
+transcribe -m kb-medium -l sv --formats txt,srt intervju.mp3
 
 # several files in one load of the model. PowerShell does not expand globs
 # for native commands, so let Get-ChildItem do it:
-py transcribe.py -m kb-large -l sv (gci *.m4a)
+transcribe -m kb-large -l sv (gci *.m4a)
 ```
 
 Progress, timings and warnings go to stderr; only the output files are written
@@ -100,11 +121,11 @@ transcripts never get committed by accident.
 Whisper mangles names it has never seen. Give it a list and they come out right:
 
 ```powershell
-py transcribe.py --vocab "EPAM, AstraZeneca, Kubernetes" meeting.m4a
-py transcribe.py --vocab @terms.txt meeting.m4a
+transcribe --vocab "EPAM, AstraZeneca, Kubernetes" meeting.m4a
+transcribe --vocab @terms.txt meeting.m4a
 ```
 
-With no `--vocab`, the script looks for `<recording>.vocab.txt` and then
+With no `--vocab`, it looks for `<recording>.vocab.txt` and then
 `vocab.txt` beside the audio, and uses the first it finds. One term per line;
 `#` starts a comment. Terms are passed as faster-whisper *hotwords*, so they
 bias every window rather than just the first - this needs the faster-whisper
@@ -130,7 +151,7 @@ backend and is ignored elsewhere.
 | `--no-minute-markers` | off | omit `[hh:mm:ss]` markers from the `.txt` |
 
 `--mode`, `--batch-size`, `--chunk-s` and `--overlap-s` apply to the
-transformers backend only; `py transcribe.py -h` covers them. `--chunk-s`
+transformers backend only; `transcribe -h` covers them. `--chunk-s`
 cannot exceed 30 - Whisper's receptive field is fixed at that length, and a
 longer window would be truncated with the remainder silently discarded.
 
@@ -150,23 +171,30 @@ accuracy, with a progress bar and an ETA in realtime multiples.
 **transformers** is the fallback, in two modes. `longform` (default) uses
 Whisper's native sequential long-form decoding. `chunked` windows the audio
 explicitly, optionally cutting on silence with Silero VAD (`--vad on`, which
-needs `pip install silero-vad`), and de-duplicates the overlap between windows.
+needs the `vad` extra), and de-duplicates the overlap between windows.
 
 ## Troubleshooting
 
 **It says "produced no text".** Usually `--vad on` on a quiet recording. Rerun
 with `--vad off`.
 
-**The transcript is in English but the audio isn't.** `-l` defaults to `en`;
-pass the right code or `-l auto`.
+**The transcript is in English but the audio isn't.** The language question
+took its default. Pass `-l sv` (or the right ISO code, or `-l auto`) explicitly
+- this happens most easily in a scheduled task, where every prompt is answered
+by its default.
 
-**"PyAV could not decode".** The script falls back to an `ffmpeg` on `PATH` if
+**"PyAV could not decode".** It falls back to an `ffmpeg` on `PATH` if
 there is one; otherwise convert the file to `.wav` first.
 
 **`OMP: Error #15`.** torch and ctranslate2 each bundle an Intel OpenMP
-runtime. The script avoids importing both, so this points at something else in
-the environment loading torch first - use a clean virtualenv.
+runtime. Transcriber avoids importing both, so this points at something else
+in the environment loading torch first - a `pipx` install cannot hit this,
+since it gets an environment of its own.
 
 **It looks hung on a long file.** Transformers long-form decoding exposes no
 per-window hook, so it prints an elapsed-time heartbeat every minute instead of
-a bar. Install faster-whisper for a real progress bar.
+a bar. The default faster-whisper backend shows a real progress bar.
+
+**`transcribe` is not recognised.** The `pipx` install puts it on your PATH, but
+an open terminal will not pick that up until you restart it. `pipx ensurepath`
+fixes a PATH that never got set up.

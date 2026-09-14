@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-transcribe.py - long-form speech transcription with Whisper.
-
-Replaces the older kb_whisper*_en.py fixed-window chunking scripts.
+transcribe - long-form speech transcription with Whisper.
 
 Backends
     faster-whisper  CTranslate2 build, roughly 4x faster than transformers on
@@ -15,21 +13,22 @@ Backends
                                            silence with Silero VAD
 
 Install
-    pip install -r requirements.txt          # recommended, CPU-friendly
-    pip install transformers torch torchaudio    # only for --backend transformers
-    pip install silero-vad                   # only for --vad on with --backend transformers
+    pipx install git+https://github.com/oppenheimer13/Transcriber
+    pip install -e .[transformers]    # only for --backend transformers
+    pip install -e .[vad]             # only for --vad on with that backend
     Decoding needs no external ffmpeg: PyAV bundles the ffmpeg libraries.
-    An ffmpeg on PATH is used as a fallback. See README.md for the full guide.
+    An ffmpeg on PATH is used as a fallback. Model weights are downloaded on
+    first use, not at install time. See README.md for the full guide.
 
 Examples
-    python transcribe.py meeting.m4a
-    python transcribe.py -m large-v3-turbo --formats txt,srt talk.wav
-    python transcribe.py -m kb-medium -l sv intervju.mp3
-    python transcribe.py --vad off meeting.m4a          # keep every quiet passage
-    python transcribe.py --backend transformers --mode chunked --vad on x.mp3
+    transcribe meeting.m4a
+    transcribe -m large-v3-turbo --formats txt,srt talk.wav
+    transcribe -m kb-medium -l sv intervju.mp3
+    transcribe --vad off meeting.m4a          # keep every quiet passage
+    transcribe --backend transformers --mode chunked --vad on x.mp3
 
 Model, language and silence filtering are asked for interactively when -m, -l
-or --vad is omitted, so a bare `python transcribe.py file.m4a` is enough.
+or --vad is omitted, so a bare `transcribe file.m4a` is enough.
 """
 
 from __future__ import annotations
@@ -48,7 +47,9 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-SCRIPT_VERSION = "2026-09-07"
+from . import __version__
+
+SCRIPT_VERSION = __version__  # recorded in the JSON metadata of every run
 SR = 16000
 WHISPER_WINDOW_S = 30.0  # Whisper's fixed receptive field
 
@@ -916,9 +917,12 @@ def pick_device(requested: str, backend: str = "transformers") -> str:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
+        prog="transcribe",  # argv[0] is the full .exe path once installed
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("--version", action="version",
+                   version=f"transcriber {__version__}")
     p.add_argument("audio", nargs="+", help="one or more audio/video files")
     p.add_argument("-m", "--model", default=None,
                    help=f"{', '.join(MODELS)}, or a Hugging Face id. "
@@ -1154,9 +1158,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 1 if failures else 0
 
 
-if __name__ == "__main__":
+def run() -> None:
+    """Console-script entry point: main() plus Ctrl-C handling."""
     try:
         sys.exit(main())
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         sys.exit(130)
+
+
+if __name__ == "__main__":
+    run()

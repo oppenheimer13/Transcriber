@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "transcriber"
+description = "Long-form speech transcription with Whisper, from the command line"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Robert Hajas" }]
+keywords = ["whisper", "transcription", "speech-to-text", "subtitles", "swedish"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+# The default faster-whisper backend. Model weights are NOT included: they are
+# fetched on first use and cached by huggingface_hub, shared across every
+# environment on the machine.
+dependencies = [
+    "numpy>=1.21",
+    "faster-whisper>=1.0.2", # 1.0.2 added `hotwords`, which --vocab relies on
+    "av>=10",                # in-process decoding; bundles ffmpeg's libraries
+    "tqdm>=4.62",            # progress bar with a realtime-factor ETA
+]
+
+dynamic = ["version"]
+
+[project.optional-dependencies]
+# `pip install transcriber[transformers]` - only for --backend transformers.
+# Large download; the default backend is several times faster on CPU.
+transformers = ["transformers>=4.40", "torch", "torchaudio"]
+# `pip install transcriber[vad]` - only for --vad on with --backend
+# transformers. The faster-whisper backend has VAD built in.
+vad = ["silero-vad"]
+
+[project.scripts]
+transcribe = "transcriber.cli:run"
+
+[tool.setuptools]
+packages = ["transcriber"]
+
+[tool.setuptools.dynamic]
+version = { attr = "transcriber.__version__" }
