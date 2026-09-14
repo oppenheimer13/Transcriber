@@ -203,7 +203,10 @@ def load_audio(path: str, sr: int = SR) -> np.ndarray:
         return _decode_av(path, sr)
     except Exception as exc:  # noqa: BLE001 - any decode failure is worth retrying
         if not shutil.which("ffmpeg"):
-            raise
+            # PyAV's errors subclass ValueError, not RuntimeError, so re-raise
+            # as RuntimeError: callers should not have to know which decoder
+            # ran to catch a bad file.
+            raise RuntimeError(f"could not decode {path}: {exc}") from exc
         print(f"  note: PyAV could not decode ({exc}); using the ffmpeg CLI",
               file=sys.stderr)
         return _decode_ffmpeg_cli(path, sr)
@@ -1011,23 +1014,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                       "backend; ignored here", file=sys.stderr)
 
         started = time.monotonic()
-        if backend_name == "faster-whisper":
-            segments = backend.transcribe(audio, vocab)
-        elif args.mode == "longform":
-            segments = backend.transcribe_longform(audio)
-        else:
-            if vad_on:
-                windows = plan_vad_chunks(audio, SR, args.chunk_s,
-                                          min_silence_ms=args.vad_min_silence)
-                dedup = False  # silence boundaries mean nothing to de-duplicate
+        try:
+            if backend_name == "faster-whisper":
+                segments = backend.transcribe(audio, vocab)
+            elif args.mode == "longform":
+                segments = backend.transcribe_longform(audio)
             else:
-                windows = plan_fixed_chunks(len(audio), SR, args.chunk_s, args.overlap_s)
-                dedup = True
-            if not windows:
-                print("  no speech detected", file=sys.stderr)
-                segments = []
-            else:
-                segments = backend.transcribe_chunked(audio, windows, dedup=dedup)
+                if vad_on:
+                    windows = plan_vad_chunks(audio, SR, args.chunk_s,
+                                              min_silence_ms=args.vad_min_silence)
+                    dedup = False  # silence boundaries mean nothing to de-duplicate
+                else:
+                    windows = plan_fixed_chunks(len(audio), SR, args.chunk_s,
+                                                args.overlap_s)
+                    dedup = True
+                if not windows:
+                    print("  no speech detected", file=sys.stderr)
+                    segments = []
+                else:
+                    segments = backend.transcribe_chunked(audio, windows, dedup=dedup)
+        except Exception as exc:  # noqa: BLE001 - one bad file must not end the batch
+            print(f"  error: {path}: {exc}", file=sys.stderr)
+            failures += 1
+            continue
 
         elapsed = time.monotonic() - started
         if elapsed > 0:
@@ -1038,7 +1047,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("  produced no text", file=sys.stderr)
 
         out_dir = args.output_dir or os.path.dirname(os.path.abspath(path))
-        os.makedirs(out_dir, exist_ok=True)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as exc:
+            print(f"  error: cannot create {out_dir}: {exc}", file=sys.stderr)
+            failures += 1
+            continue
         stem = os.path.splitext(os.path.basename(path))[0]
         meta = {
             "source": os.path.basename(path),
@@ -1064,15 +1078,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             },
             "script_version": SCRIPT_VERSION,
         }
-        for fmt in formats:
-            out_path = os.path.join(out_dir, f"{stem}.{fmt}")
-            if fmt == "txt":
-                write_txt(segments, out_path, minute_markers=not args.no_minute_markers)
-            elif fmt == "json":
-                write_json(segments, out_path, meta)
-            else:
-                WRITERS[fmt](segments, out_path)
-            print(f"  wrote {out_path}", file=sys.stderr)
+        try:
+            for fmt in formats:
+                out_path = os.path.join(out_dir, f"{stem}.{fmt}")
+                if fmt == "txt":
+                    write_txt(segments, out_path,
+                              minute_markers=not args.no_minute_markers)
+                elif fmt == "json":
+                    write_json(segments, out_path, meta)
+                else:
+                    WRITERS[fmt](segments, out_path)
+                print(f"  wrote {out_path}", file=sys.stderr)
+        except OSError as exc:  # full disk, read-only dir, locked file
+            print(f"  error: could not write output for {path}: {exc}",
+                  file=sys.stderr)
+            failures += 1
 
     return 1 if failures else 0
 
