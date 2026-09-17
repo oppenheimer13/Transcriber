@@ -863,21 +863,34 @@ def load_vocab(spec: str) -> List[str]:
     Returns a list rather than a joined string so that a term containing a
     comma ("Smith, John") stays one term - joining first and splitting later
     counted it as two.
+
+    A file that cannot be read or decoded raises RuntimeError, so a batch can
+    skip the one recording it belongs to.
     """
     if not spec:
         return []
     if spec.startswith("@"):
         path = spec[1:]
         try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            raise RuntimeError(f"could not read vocabulary file: {exc}") from exc
+        try:
             # utf-8-sig: Notepad and PowerShell often write a BOM, which would
             # otherwise end up glued to the first term
-            with open(path, encoding="utf-8-sig") as fh:
-                # strip before testing for '#': an indented comment is still a
-                # comment, and was otherwise imported as a vocabulary term
-                lines = (line.strip() for line in fh)
-                return [ln for ln in lines if ln and not ln.startswith("#")]
-        except OSError as exc:
-            raise SystemExit(f"could not read vocabulary file: {exc}") from exc
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            # Notepad's "ANSI" encoding stores ö and å as single bytes that are
+            # not valid UTF-8. This is a ValueError, so the OSError handler
+            # above never saw it and the run ended in a traceback.
+            lineno = exc.object[:exc.start].count(b"\n") + 1
+            raise RuntimeError(f"vocabulary file {path} is not UTF-8 (line "
+                               f"{lineno}); re-save it with UTF-8 encoding") from exc
+        # strip before testing for '#': an indented comment is still a
+        # comment, and was otherwise imported as a vocabulary term
+        lines = (line.strip() for line in text.splitlines())
+        return [ln for ln in lines if ln and not ln.startswith("#")]
     return [t.strip() for t in spec.split(",") if t.strip()]
 
 
@@ -988,6 +1001,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "silently truncated, losing the remainder of the window."
         )
 
+    # An explicit --vocab is the same for every recording, so read it once and
+    # now: a bad path should not wait for the model to load.
+    explicit_vocab: List[str] = []
+    if args.vocab:
+        try:
+            explicit_vocab = load_vocab(args.vocab)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+
     model_name = args.model or prompt_for_model()
     backend_name = pick_backend(args.backend, model_name)
     model_id = resolve_model(model_name, backend_name)
@@ -1059,12 +1081,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             warned_speed = True
 
         if args.vocab:
-            vocab = load_vocab(args.vocab)
+            vocab = explicit_vocab
             # only a file has a name worth printing; inline terms are the text
             vocab_source = args.vocab[1:] if args.vocab.startswith("@") else None
         else:
             found = find_vocab(path)
-            vocab = load_vocab("@" + found) if found else []
+            try:
+                vocab = load_vocab("@" + found) if found else []
+            except RuntimeError as exc:
+                # carrying on without it would quietly get the names wrong
+                print(f"  error: {path}: {exc}", file=sys.stderr)
+                failures += 1
+                continue
             vocab_source = found
         if vocab:
             origin = (f" from {os.path.basename(vocab_source)}"

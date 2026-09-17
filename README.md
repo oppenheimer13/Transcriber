@@ -126,8 +126,8 @@ transcribe --vocab @terms.txt meeting.m4a
 ```
 
 With no `--vocab`, it looks for `<recording>.vocab.txt` and then
-`vocab.txt` beside the audio, and uses the first it finds. One term per line;
-`#` starts a comment. Terms are passed as faster-whisper *hotwords*, so they
+`vocab.txt` beside the audio, and uses the first it finds. One term per line,
+saved as UTF-8; `#` starts a comment. Terms are passed as faster-whisper *hotwords*, so they
 bias every window rather than just the first - this needs the faster-whisper
 backend and is ignored elsewhere.
 
